@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 from collections import defaultdict
-from gurobipy import Model, GRB, quicksum
+from pulp import LpMaximize, LpProblem, LpVariable, lpSum, LpBinary, PulpSolverError
 import matplotlib.pyplot as plt
 from textwrap import wrap
 from datetime import datetime
@@ -13,7 +13,6 @@ st.title("🎓 Grade Inteligente — Otimização de Disciplinas")
 # ================================================================
 # CARREGAR PLANILHA
 # ================================================================
-
 uploaded_file = st.file_uploader("📂 Envie sua planilha Excel (restricao_grade.xlsx)", type=["xlsx"])
 
 if uploaded_file is not None:
@@ -56,9 +55,8 @@ def filtrar_materias_viaveis(df):
 
     return df.loc[viaveis].reset_index(drop=True)
 
-
 # ================================================================
-# SELEÇÃO DE DISCIPLINAS CONCLUÍDAS (checkboxes)
+# SELEÇÃO DE DISCIPLINAS CONCLUÍDAS
 # ================================================================
 st.header("✅ Selecione as disciplinas já concluídas:")
 
@@ -68,24 +66,18 @@ for periodo in sorted(df["Periodo"].unique()):
     for i, row in subset.iterrows():
         df.at[i, "COMPLETOU"] = st.checkbox(row["TÍTULO"], value=row["COMPLETOU"], key=row["x"])
 
-# Filtrar matérias possíveis
-base_pendente = filtrar_materias_viaveis(df)
-
 # ================================================================
-# MODELO DE OTIMIZAÇÃO (GUROBI)
+# EXECUTAR OTIMIZAÇÃO COM PULP
 # ================================================================
 def executar_otimizacao(df):
-    model = Model("grade_otimizada")
-    model.Params.OutputFlag = 0  # silencia o log
-
-    xvars = {i: model.addVar(vtype=GRB.BINARY, name=str(df.loc[i, "x"]).strip()) for i in df.index}
-    model.update()
+    model = LpProblem("grade_otimizada", LpMaximize)
+    xvars = {i: LpVariable(f"x_{i}", cat=LpBinary) for i in df.index}
 
     pesos = pd.to_numeric(df["funcao_obj"], errors="coerce").fillna(0.0)
-    model.setObjective(quicksum(pesos[i] * xvars[i] for i in df.index), GRB.MAXIMIZE)
+    model += lpSum(pesos[i] * xvars[i] for i in df.index)
 
-    model.addConstr(quicksum(xvars[i] for i in df.index) >= 2)
-    model.addConstr(quicksum(xvars[i] for i in df.index) <= 10)
+    model += lpSum(xvars[i] for i in df.index) >= 2
+    model += lpSum(xvars[i] for i in df.index) <= 10
 
     def parse_slots(codigo):
         slots = []
@@ -99,7 +91,6 @@ def executar_otimizacao(df):
         return set(slots)
 
     idx_to_slots = {i: parse_slots(df.loc[i, "codigo de horario"]) for i in df.index}
-
     timeslot_to_courses = defaultdict(list)
     for i in df.index:
         for slot in idx_to_slots[i]:
@@ -107,16 +98,12 @@ def executar_otimizacao(df):
 
     for slot, courses in timeslot_to_courses.items():
         if len(courses) > 1:
-            model.addConstr(quicksum(xvars[i] for i in courses) <= 1)
+            model += lpSum(xvars[i] for i in courses) <= 1
 
-    model.optimize()
+    model.solve()
 
-    if model.status != GRB.OPTIMAL:
-        return None, None
-
-    selecionadas = [i for i in df.index if xvars[i].X > 0.5]
+    selecionadas = [i for i in df.index if xvars[i].value() > 0.5]
     return selecionadas, idx_to_slots
-
 
 # ================================================================
 # BOTÃO PRINCIPAL
@@ -124,15 +111,15 @@ def executar_otimizacao(df):
 if st.button("🚀 Gerar Grade Otimizada"):
     start_time = datetime.now()
     try:
-        selecionadas, idx_to_slots = executar_otimizacao(base_pendente)
+        selecionadas, idx_to_slots = executar_otimizacao(filtrar_materias_viaveis(df))
         tempo_exec = (datetime.now() - start_time).total_seconds()
 
-        if selecionadas is None:
-            st.error("Nenhuma solução ótima encontrada.")
+        if not selecionadas:
+            st.error("Nenhuma solução encontrada.")
         else:
             st.success(f"✅ Grade gerada em {tempo_exec:.2f} segundos!")
 
-            resultado = base_pendente.loc[selecionadas, ["TÍTULO", "Periodo", "funcao_obj", "codigo de horario"]]
+            resultado = df.loc[selecionadas, ["TÍTULO", "Periodo", "funcao_obj", "codigo de horario"]]
             resultado = resultado.sort_values(by="Periodo")
 
             st.dataframe(resultado)
@@ -140,6 +127,8 @@ if st.button("🚀 Gerar Grade Otimizada"):
             csv = resultado.to_csv(index=False).encode("utf-8")
             st.download_button("📥 Baixar resultado (CSV)", data=csv, file_name="grade_otimizada.csv", mime="text/csv")
 
+    except PulpSolverError:
+        st.error("Erro ao resolver a otimização.")
     except Exception as e:
         st.error(f"Ocorreu um erro: {e}")
 
@@ -147,4 +136,4 @@ if st.button("🚀 Gerar Grade Otimizada"):
 # RODAPÉ
 # ================================================================
 st.markdown("---")
-st.caption("Desenvolvido por Maria Veronica • Projeto Grade Inteligente")
+st.caption("Desenvolvido por Sávio • Projeto Grade Inteligente")
