@@ -1,80 +1,150 @@
-# app.py
 import streamlit as st
 import pandas as pd
+from collections import defaultdict
+from gurobipy import Model, GRB, quicksum
+import matplotlib.pyplot as plt
+from textwrap import wrap
 from datetime import datetime
-import gspread
-from google.oauth2.service_account import Credentials
 
-# ======================================================
-# CONFIGURAÇÃO DO GOOGLE SHEETS
-# ======================================================
-SHEET_NAME = "tabela_dados_limpos"
-LOG_SHEET = "log_execucao"
-
-scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-credentials = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scope)
-client = gspread.authorize(credentials)
-sheet = client.open("planilha_tcc").worksheet(SHEET_NAME)
-
-# ======================================================
-# FUNÇÕES
-# ======================================================
-def carregar_dados():
-    """Lê os dados da planilha Google Sheets."""
-    return pd.DataFrame(sheet.get_all_records())
-
-def registrar_log(tempo_exec, status):
-    """Registra o tempo e status da execução no log."""
-    log_sheet = client.open("planilha_tcc").worksheet(LOG_SHEET)
-    log_sheet.append_row([str(datetime.now()), tempo_exec, status])
-
-def executar_otimizacao(df):
-    """Simula a otimização (substituir depois pelo seu modelo Gurobi real)."""
-    pendentes = df[df["COMPLETOU"] == False]
-    selecionadas = pendentes.head(5)  # Exemplo: pega 5 matérias pendentes
-    return selecionadas
-
-# ======================================================
-# INTERFACE WEB
-# ======================================================
 st.set_page_config(page_title="Grade Inteligente", layout="wide")
 
-st.title("🎓 Gerador de Grade Horária Inteligente")
-st.write("Marque abaixo as disciplinas que você já concluiu:")
+st.title("🎓 Grade Inteligente — Otimização de Disciplinas")
 
-# Carregar dados do Sheets
-df = carregar_dados()
+# ================================================================
+# CARREGAR PLANILHA
+# ================================================================
 
-# Exibir checkboxes organizados por período
+uploaded_file = st.file_uploader("📂 Envie sua planilha Excel (restricao_grade.xlsx)", type=["xlsx"])
+
+if uploaded_file is not None:
+    df = pd.read_excel(uploaded_file)
+    st.success("✅ Planilha carregada com sucesso!")
+else:
+    st.info("Carregando planilha padrão (restricao_grade.xlsx)...")
+    df = pd.read_excel("restricao_grade.xlsx")
+
+# ================================================================
+# FUNÇÃO PARA FILTRAR MATÉRIAS VIÁVEIS
+# ================================================================
+def filtrar_materias_viaveis(df):
+    materias_cursadas = set(df[df["COMPLETOU"] == True]["TÍTULO"])
+    creditos_cursados = df[df["COMPLETOU"] == True]["CRÉDITOS"].sum()
+    viaveis = []
+
+    for i, row in df.iterrows():
+        if row["COMPLETOU"]:
+            continue
+
+        pre_requisitos = str(row["TÍTULO PRE REQUISITO"])
+        if pre_requisitos in ["", "NaN", "nan", "None"]:
+            viaveis.append(i)
+            continue
+
+        titulo = row["TÍTULO"]
+
+        # Casos especiais
+        if titulo == "Projeto Final I" and creditos_cursados >= 140:
+            viaveis.append(i)
+            continue
+        if titulo == "Estágio Supervisionado" and creditos_cursados >= 120:
+            viaveis.append(i)
+            continue
+
+        pre_req_lista = [p.strip() for p in pre_requisitos.split("/") if p.strip()]
+        if all(pr in materias_cursadas for pr in pre_req_lista):
+            viaveis.append(i)
+
+    return df.loc[viaveis].reset_index(drop=True)
+
+
+# ================================================================
+# SELEÇÃO DE DISCIPLINAS CONCLUÍDAS (checkboxes)
+# ================================================================
+st.header("✅ Selecione as disciplinas já concluídas:")
+
 for periodo in sorted(df["Periodo"].unique()):
     st.subheader(f"📘 Período {periodo}")
     subset = df[df["Periodo"] == periodo]
     for i, row in subset.iterrows():
-        df.at[i, "COMPLETOU"] = st.checkbox(
-            row["TÍTULO"],
-            value=row["COMPLETOU"],
-            key=row["x"]
-        )
+        df.at[i, "COMPLETOU"] = st.checkbox(row["TÍTULO"], value=row["COMPLETOU"], key=row["x"])
 
-# Botão principal
-if st.button("Gerar Grade Otimizada"):
+# Filtrar matérias possíveis
+base_pendente = filtrar_materias_viaveis(df)
+
+# ================================================================
+# MODELO DE OTIMIZAÇÃO (GUROBI)
+# ================================================================
+def executar_otimizacao(df):
+    model = Model("grade_otimizada")
+    model.Params.OutputFlag = 0  # silencia o log
+
+    xvars = {i: model.addVar(vtype=GRB.BINARY, name=str(df.loc[i, "x"]).strip()) for i in df.index}
+    model.update()
+
+    pesos = pd.to_numeric(df["funcao_obj"], errors="coerce").fillna(0.0)
+    model.setObjective(quicksum(pesos[i] * xvars[i] for i in df.index), GRB.MAXIMIZE)
+
+    model.addConstr(quicksum(xvars[i] for i in df.index) >= 2)
+    model.addConstr(quicksum(xvars[i] for i in df.index) <= 10)
+
+    def parse_slots(codigo):
+        slots = []
+        for token in str(codigo).replace(" ", "").split("-"):
+            if not token:
+                continue
+            hora = "".join(ch for ch in token if ch.isdigit())
+            dia = "".join(ch for ch in token if ch.isalpha()).lower()
+            if hora and dia:
+                slots.append((dia, int(hora)))
+        return set(slots)
+
+    idx_to_slots = {i: parse_slots(df.loc[i, "codigo de horario"]) for i in df.index}
+
+    timeslot_to_courses = defaultdict(list)
+    for i in df.index:
+        for slot in idx_to_slots[i]:
+            timeslot_to_courses[slot].append(i)
+
+    for slot, courses in timeslot_to_courses.items():
+        if len(courses) > 1:
+            model.addConstr(quicksum(xvars[i] for i in courses) <= 1)
+
+    model.optimize()
+
+    if model.status != GRB.OPTIMAL:
+        return None, None
+
+    selecionadas = [i for i in df.index if xvars[i].X > 0.5]
+    return selecionadas, idx_to_slots
+
+
+# ================================================================
+# BOTÃO PRINCIPAL
+# ================================================================
+if st.button("🚀 Gerar Grade Otimizada"):
     start_time = datetime.now()
     try:
-        resultado = executar_otimizacao(df)
-        tempo_total = (datetime.now() - start_time).total_seconds()
-        registrar_log(tempo_total, "OK")
+        selecionadas, idx_to_slots = executar_otimizacao(base_pendente)
+        tempo_exec = (datetime.now() - start_time).total_seconds()
 
-        st.success(f"Grade gerada em {tempo_total:.2f} segundos!")
-        st.dataframe(resultado[["TÍTULO", "Periodo"]])
+        if selecionadas is None:
+            st.error("Nenhuma solução ótima encontrada.")
+        else:
+            st.success(f"✅ Grade gerada em {tempo_exec:.2f} segundos!")
 
-        # Download CSV
-        st.download_button(
-            "⬇️ Baixar resultado (CSV)",
-            data=resultado.to_csv(index=False).encode("utf-8"),
-            file_name="grade_otimizada.csv",
-            mime="text/csv",
-        )
+            resultado = base_pendente.loc[selecionadas, ["TÍTULO", "Periodo", "funcao_obj", "codigo de horario"]]
+            resultado = resultado.sort_values(by="Periodo")
+
+            st.dataframe(resultado)
+
+            csv = resultado.to_csv(index=False).encode("utf-8")
+            st.download_button("📥 Baixar resultado (CSV)", data=csv, file_name="grade_otimizada.csv", mime="text/csv")
 
     except Exception as e:
-        st.error(f"Erro: {e}")
-        registrar_log(0, f"ERRO: {e}")
+        st.error(f"Ocorreu um erro: {e}")
+
+# ================================================================
+# RODAPÉ
+# ================================================================
+st.markdown("---")
+st.caption("Desenvolvido por Maria Veronica • Projeto Grade Inteligente")
